@@ -331,9 +331,6 @@ def main() -> None:
     # Crear aplicación
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Inicializar cliente de Telethon
-    asyncio.create_task(copy_bot.start_client())
-    
     # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -348,9 +345,14 @@ def main() -> None:
     # Error handler
     application.add_error_handler(error_handler)
     
+    # Initialize the Telethon client before starting the application
+    async def start_bot():
+        await copy_bot.start_client()
+        await application.run_polling()
+    
     # Ejecutar bot
     print("🤖 Bot iniciado...")
-    application.run_polling()
+    asyncio.run(start_bot())
 
 if __name__ == '__main__':
     main()
