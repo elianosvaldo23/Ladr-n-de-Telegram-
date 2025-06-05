@@ -1,6 +1,5 @@
 import logging
 import re
-import asyncio
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -10,6 +9,9 @@ from telethon.errors import ChannelPrivateError, UsernameNotOccupiedError
 import os
 from dotenv import load_dotenv
 from telethon.sessions import StringSession
+import sys
+import asyncio
+from contextlib import suppress
 
 # Configurar logging
 logging.basicConfig(
@@ -33,18 +35,24 @@ PREMIUM_USERS = set()
 
 class ContentCopyBot:
     def __init__(self):
-        self.client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        self.client = None
         
     async def start_client(self):
         """Inicializar cliente de Telethon"""
-        try:
+        if self.client is None:
+            self.client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        
+        if not self.client.is_connected():
             await self.client.connect()
-            if not await self.client.is_user_authorized():
-                logger.error("Cliente no autorizado. Verifique SESSION_STRING")
-                raise Exception("Cliente no autorizado")
-        except Exception as e:
-            logger.error(f"Error al iniciar cliente: {e}")
-            raise
+            
+        if not await self.client.is_user_authorized():
+            logger.error("Cliente no autorizado. Verifique SESSION_STRING")
+            raise Exception("Cliente no autorizado")
+
+    async def stop_client(self):
+        """Detener cliente de Telethon"""
+        if self.client and self.client.is_connected():
+            await self.client.disconnect()
         
     async def copy_content(self, channel_url: str, message_id: int, is_premium: bool = False):
         """Copiar contenido de un canal protegido"""
@@ -335,45 +343,56 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Manejar errores"""
     logger.error(f"Update {update} caused error {context.error}")
 
-async def main() -> None:
-    """Función principal"""
-    # Crear bot y cliente
-    application = Application.builder().token(BOT_TOKEN).build()
-    copy_bot = ContentCopyBot()
+async def start_bot():
+    """Iniciar el bot con manejo apropiado de recursos"""
+    # Crear aplicación
+    app = Application.builder().token(BOT_TOKEN).build()
     
+    # Registrar handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("premium", premium_info))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("bulk", bulk_copy_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_error_handler(error_handler)
+
     try:
         # Iniciar cliente de Telethon
         await copy_bot.start_client()
         
-        # Registrar handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("premium", premium_info))
-        application.add_handler(CommandHandler("status", status_command))
-        application.add_handler(CommandHandler("bulk", bulk_copy_command))
-        application.add_handler(CallbackQueryHandler(button_handler))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-        application.add_error_handler(error_handler)
-        
+        # Iniciar bot
         print("🤖 Bot iniciado...")
-        
-        # Iniciar el bot
-        await application.initialize()
-        await application.start()
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        await app.initialize()
+        await app.start()
+        await app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
         
     except Exception as e:
         logger.error(f"Error al iniciar el bot: {e}")
         raise
     finally:
         # Limpiar recursos
-        await application.stop()
-        await copy_bot.client.disconnect()
+        with suppress(Exception):
+            await app.stop()
+        with suppress(Exception):
+            await copy_bot.stop_client()
 
-if __name__ == '__main__':
+def main():
+    """Función principal con manejo de eventos del sistema"""
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+        # Configurar y ejecutar el event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(start_bot())
+    except KeyboardInterrupt:
         logger.info("Bot detenido por el usuario")
     except Exception as e:
         logger.error(f"Error fatal: {e}")
+    finally:
+        # Limpiar el event loop
+        with suppress(Exception):
+            loop.close()
+
+if __name__ == '__main__':
+    main()
