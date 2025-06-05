@@ -2,16 +2,13 @@ import logging
 import re
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.errors import ChannelPrivateError, UsernameNotOccupiedError
 import os
 from dotenv import load_dotenv
 from telethon.sessions import StringSession
-import sys
-import asyncio
-from contextlib import suppress
 
 # Configurar logging
 logging.basicConfig(
@@ -24,38 +21,31 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Configuración
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-API_ID = int(os.getenv('API_ID'))
-API_HASH = os.getenv('API_HASH')
-PHONE_NUMBER = os.getenv('PHONE_NUMBER')
-SESSION_STRING = os.getenv('SESSION_STRING')
+BOT_TOKEN = "7755147755:AAFwEVI5vL2BOWWxJGjqRnJamVk2djNQ-EM"
+API_ID = 21410894
+API_HASH = "abc158fa56ca252ed9cf0e3aa530f658"
+PHONE_NUMBER = "+15812425775"
 
-# Lista de usuarios premium
-PREMIUM_USERS = set()
+# Lista de usuarios premium (puedes modificar esta lista según necesites)
+PREMIUM_USERS = {1742433244}  # Agrega los IDs de usuarios premium aquí
 
 class ContentCopyBot:
     def __init__(self):
-        self.client = None
+        self.client = TelegramClient(StringSession(), API_ID, API_HASH)
         
     async def start_client(self):
-        """Inicializar cliente de Telethon"""
-        if self.client is None:
-            self.client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-        
-        if not self.client.is_connected():
-            await self.client.connect()
-            
+        """Iniciar cliente de Telethon"""
+        await self.client.connect()
         if not await self.client.is_user_authorized():
-            logger.error("Cliente no autorizado. Verifique SESSION_STRING")
-            raise Exception("Cliente no autorizado")
+            await self.client.send_code_request(PHONE_NUMBER)
+            try:
+                await self.client.sign_in(PHONE_NUMBER, input('Ingrese el código recibido: '))
+            except Exception as e:
+                logger.error(f"Error en autenticación: {e}")
+                raise
 
-    async def stop_client(self):
-        """Detener cliente de Telethon"""
-        if self.client and self.client.is_connected():
-            await self.client.disconnect()
-        
     async def copy_content(self, channel_url: str, message_id: int, is_premium: bool = False):
-        """Copiar contenido de un canal protegido"""
+        """Copiar contenido de un canal"""
         try:
             # Extraer username del canal
             username = self.extract_username(channel_url)
@@ -83,7 +73,7 @@ class ContentCopyBot:
                 
         except Exception as e:
             return None, f"❌ Error general: {str(e)}"
-    
+
     async def bulk_copy(self, channel_url: str, limit: int = 10):
         """Copia masiva de contenido (solo premium)"""
         try:
@@ -98,8 +88,9 @@ class ContentCopyBot:
             
         except Exception as e:
             return None, f"❌ Error en copia masiva: {str(e)}"
-    
-    def extract_username(self, url: str) -> Optional[str]:
+
+    @staticmethod
+    def extract_username(url: str) -> Optional[str]:
         """Extraer username de URL de Telegram"""
         patterns = [
             r't\.me/([^/]+)',
@@ -112,34 +103,33 @@ class ContentCopyBot:
             if match:
                 return match.group(1)
         return None
-    
-    def extract_message_id(self, url: str) -> Optional[int]:
+
+    @staticmethod
+    def extract_message_id(url: str) -> Optional[int]:
         """Extraer ID del mensaje de la URL"""
         match = re.search(r'/(\d+)$', url)
         if match:
             return int(match.group(1))
         return None
 
-# Instancia del bot
+# Instancia global del bot
 copy_bot = ContentCopyBot()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start"""
     user = update.effective_user
-    
     welcome_text = f"""👋 ¡Hola {user.first_name}!
 
-💬 Puedo saltar las restricciones de copia, descarga y reenvío de los canales.
+💬 Puedo ayudarte a copiar contenido de canales.
 
-🔗 Envíame el enlace de una publicación, realizada en un Canal con Protección de Contenido, para copiar su contenido aquí.
+🔗 Envíame el enlace de una publicación para copiar su contenido aquí.
 
 • Versión Gratuita:
-- Permite copiar de canales públicos.
+- Permite copiar de canales públicos
 
 • Versión Premium:
-- Permite copiar de canales públicos.
-- Permite copiar de canales privados.
-- Permite la copia masiva del contenido.
+- Permite copiar de canales públicos y privados
+- Permite copia masiva de contenido
 
 📋 Comandos disponibles:
 /help - Ver ayuda
@@ -151,10 +141,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("⭐ Premium", callback_data='premium')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /help"""
     help_text = """📋 **Comandos Disponibles:**
 
@@ -174,16 +163,12 @@ Envía un enlace de canal como:
 • Imágenes
 • Videos
 • Documentos
-• Enlaces
-
-⚠️ **Importante:**
-- Respeta los derechos de autor
-- Usa responsablemente"""
+• Enlaces"""
 
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
-async def premium_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Información sobre premium"""
+async def premium_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /premium"""
     user_id = update.effective_user.id
     is_premium = user_id in PREMIUM_USERS
     
@@ -217,8 +202,8 @@ Para activar Premium, contacta: @admin"""
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ver estado del usuario"""
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /status"""
     user = update.effective_user
     is_premium = user.id in PREMIUM_USERS
     
@@ -235,8 +220,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.reply_text(status_text, parse_mode='Markdown')
 
-async def bulk_copy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando para copia masiva"""
+async def bulk_copy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /bulk"""
     user_id = update.effective_user.id
     
     if user_id not in PREMIUM_USERS:
@@ -281,18 +266,16 @@ async def bulk_copy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             logger.error(f"Error copiando mensaje: {e}")
             continue
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manejar enlaces de Telegram"""
     text = update.message.text
     user_id = update.effective_user.id
     is_premium = user_id in PREMIUM_USERS
     
-    # Verificar si es un enlace de Telegram
     if not re.search(r't\.me|telegram\.me', text):
         await update.message.reply_text("❌ Por favor envía un enlace válido de Telegram")
         return
     
-    # Extraer información
     message_id = copy_bot.extract_message_id(text)
     if not message_id:
         await update.message.reply_text("❌ No se pudo extraer el ID del mensaje del enlace")
@@ -300,99 +283,80 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     await update.message.reply_text("🔄 Procesando enlace...")
     
-    # Copiar contenido
     message, error = await copy_bot.copy_content(text, message_id, is_premium)
     
     if error:
         await update.message.reply_text(error)
         return
     
-    if not message:
-        await update.message.reply_text("❌ No se pudo obtener el contenido")
-        return
-    
-    # Enviar contenido copiado
     try:
         if message.text:
-            await update.message.reply_text(f"📋 **Contenido copiado:**\n\n{message.text}", parse_mode='Markdown')
+            await update.message.reply_text(message.text)
         elif message.photo:
-            await update.message.reply_photo(message.photo, caption=f"📋 Imagen copiada\n{message.caption or ''}")
+            await update.message.reply_photo(message.photo, caption=message.caption or "")
         elif message.video:
-            await update.message.reply_video(message.video, caption=f"📋 Video copiado\n{message.caption or ''}")
+            await update.message.reply_video(message.video, caption=message.caption or "")
         elif message.document:
-            await update.message.reply_document(message.document, caption=f"📋 Documento copiado\n{message.caption or ''}")
+            await update.message.reply_document(message.document, caption=message.caption or "")
         else:
-            await update.message.reply_text("✅ Contenido procesado (tipo no soportado para vista previa)")
-            
+            await update.message.reply_text("✅ Contenido procesado (tipo no soportado)")
     except Exception as e:
         await update.message.reply_text(f"❌ Error al enviar contenido: {str(e)}")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manejar botones inline"""
     query = update.callback_query
     await query.answer()
     
     if query.data == 'help':
-        await help_command(query, context)
+        await help_command(update, context)
     elif query.data == 'premium':
-        await premium_info(query, context)
+        await premium_info(update, context)
     elif query.data == 'activate_premium':
-        await query.edit_message_text("💳 Para activar Premium, contacta a @admin con tu ID: " + str(query.from_user.id))
+        await query.edit_message_text(
+            "💳 Para activar Premium, contacta a @admin con tu ID: " + str(query.from_user.id)
+        )
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manejar errores"""
     logger.error(f"Update {update} caused error {context.error}")
 
-async def start_bot():
-    """Iniciar el bot con manejo apropiado de recursos"""
-    # Crear aplicación
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Registrar handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("premium", premium_info))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("bulk", bulk_copy_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_error_handler(error_handler)
-
-    try:
-        # Iniciar cliente de Telethon
-        await copy_bot.start_client()
-        
-        # Iniciar bot
-        print("🤖 Bot iniciado...")
-        await app.initialize()
-        await app.start()
-        await app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
-        
-    except Exception as e:
-        logger.error(f"Error al iniciar el bot: {e}")
-        raise
-    finally:
-        # Limpiar recursos
-        with suppress(Exception):
-            await app.stop()
-        with suppress(Exception):
-            await copy_bot.stop_client()
-
 def main():
-    """Función principal con manejo de eventos del sistema"""
+    """Función principal"""
     try:
-        # Configurar y ejecutar el event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(start_bot())
-    except KeyboardInterrupt:
-        logger.info("Bot detenido por el usuario")
+        # Crear aplicación
+        app = Application.builder().token(BOT_TOKEN).build()
+        
+        # Registrar handlers
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("premium", premium_info))
+        app.add_handler(CommandHandler("status", status_command))
+        app.add_handler(CommandHandler("bulk", bulk_copy_command))
+        app.add_handler(CallbackQueryHandler(button_handler))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+        app.add_error_handler(error_handler)
+        
+        # Configuración para Render
+        PORT = int(os.getenv('PORT', '8080'))
+        
+        # Mensaje de inicio
+        print("🤖 Bot iniciado...")
+        
+        # Iniciar el bot
+        if os.getenv('ENVIRONMENT') == 'production':
+            # Modo producción (Render)
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                webhook_url=os.getenv('WEBHOOK_URL', f"https://{os.getenv('RENDER_EXTERNAL_URL')}")
+            )
+        else:
+            # Modo desarrollo (local)
+            app.run_polling(allowed_updates=Update.ALL_TYPES)
+            
     except Exception as e:
-        logger.error(f"Error fatal: {e}")
-    finally:
-        # Limpiar el event loop
-        with suppress(Exception):
-            loop.close()
+        logger.error(f"Error en la ejecución del bot: {e}")
 
 if __name__ == '__main__':
     main()
