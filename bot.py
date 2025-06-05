@@ -9,6 +9,7 @@ from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.errors import ChannelPrivateError, UsernameNotOccupiedError
 import os
 from dotenv import load_dotenv
+from telethon.sessions import StringSession
 
 # Cargar variables de entorno
 load_dotenv()
@@ -18,6 +19,8 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 PHONE_NUMBER = os.getenv('PHONE_NUMBER')
+# Añadir nueva variable de entorno para la sesión
+SESSION_STRING = os.getenv('SESSION_STRING')
 
 # Configurar logging
 logging.basicConfig(
@@ -26,16 +29,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Lista de usuarios premium (puedes usar una base de datos)
-PREMIUM_USERS = set()
-
 class ContentCopyBot:
     def __init__(self):
-        self.client = TelegramClient('session', API_ID, API_HASH)
+        # Usar StringSession en lugar de archivo de sesión
+        self.client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         
     async def start_client(self):
         """Inicializar cliente de Telethon"""
-        await self.client.start(phone=PHONE_NUMBER)
+        # Conectar sin necesidad de autenticación interactiva
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            logger.error("Cliente no autorizado. Asegúrese de que SESSION_STRING sea válida.")
+            raise Exception("Cliente no autorizado")
         
     async def copy_content(self, channel_url: str, message_id: int, is_premium: bool = False):
         """Copiar contenido de un canal protegido"""
@@ -328,6 +333,14 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     """Función principal"""
+    # Verificar variables de entorno requeridas
+    required_env_vars = ['BOT_TOKEN', 'API_ID', 'API_HASH', 'SESSION_STRING']
+    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logger.error(f"Faltan variables de entorno requeridas: {', '.join(missing_vars)}")
+        return
+
     # Crear aplicación
     application = Application.builder().token(BOT_TOKEN).build()
     
@@ -338,18 +351,18 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("bulk", bulk_copy_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    
-    # Handler para enlaces
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    
-    # Error handler
     application.add_error_handler(error_handler)
     
-    # Initialize the Telethon client before starting the application
+    # Initialize the bot with proper async handling
     async def start_bot():
-        await copy_bot.start_client()
-        await application.run_polling()
-    
+        try:
+            await copy_bot.start_client()
+            await application.run_polling()
+        except Exception as e:
+            logger.error(f"Error al iniciar el bot: {e}")
+            raise
+
     # Ejecutar bot
     print("🤖 Bot iniciado...")
     asyncio.run(start_bot())
