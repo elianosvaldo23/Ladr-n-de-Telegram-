@@ -22,14 +22,24 @@ logger = logging.getLogger(__name__)
 # Cargar variables de entorno
 load_dotenv()
 
-# Configuración
-BOT_TOKEN = "7755147755:AAFwEVI5vL2BOWWxJGjqRnJamVk2djNQ-EM"
-API_ID = 21410894
-API_HASH = "abc158fa56ca252ed9cf0e3aa530f658"
-PHONE_NUMBER = "+15812425775"
+# Configuración desde variables de entorno
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 
-# Lista de usuarios premium (puedes modificar esta lista según necesites)
-PREMIUM_USERS = {1742433244}  # Agrega los IDs de usuarios premium aquí
+# Lista de usuarios premium desde variable de entorno
+try:
+    premium_users_str = os.getenv("PREMIUM_USERS", "")
+    PREMIUM_USERS = {int(uid.strip()) for uid in premium_users_str.split(",") if uid.strip()}
+except ValueError:
+    PREMIUM_USERS = set()
+    logger.warning("Error al parsear PREMIUM_USERS, usando conjunto vacío")
+
+# Verificar que las variables estén configuradas
+if not all([BOT_TOKEN, API_ID, API_HASH, PHONE_NUMBER]):
+    logger.error("Faltan variables de entorno requeridas. Verifica tu archivo .env")
+    raise ValueError("Configuración incompleta")
 
 class ContentCopyBot:
     def __init__(self):
@@ -37,6 +47,12 @@ class ContentCopyBot:
         self.session_string = ""
         self.client = None
         self.is_initialized = False
+        # Control de rate limiting para evitar ban
+        self.last_request_time = 0
+        self.min_delay_between_requests = 2.0  # segundos entre peticiones
+        self.request_count = 0
+        self.request_limit_per_minute = 20  # límite de peticiones por minuto
+        self.request_times = []
         
     async def initialize_client(self):
         """Inicializar y autenticar el cliente de Telethon"""
@@ -79,10 +95,39 @@ class ContentCopyBot:
             await self.client.connect()
             
         return self.client.is_connected()
+    
+    async def rate_limit_check(self):
+        """Control de rate limiting para evitar ban de Telegram"""
+        current_time = time.time()
+        
+        # Limpiar peticiones antiguas (más de 1 minuto)
+        self.request_times = [t for t in self.request_times if current_time - t < 60]
+        
+        # Verificar límite por minuto
+        if len(self.request_times) >= self.request_limit_per_minute:
+            wait_time = 60 - (current_time - self.request_times[0])
+            if wait_time > 0:
+                logger.warning(f"Rate limit alcanzado. Esperando {wait_time:.1f} segundos...")
+                await asyncio.sleep(wait_time + 1)
+                self.request_times = []
+        
+        # Verificar delay mínimo entre peticiones
+        time_since_last = current_time - self.last_request_time
+        if time_since_last < self.min_delay_between_requests:
+            wait_time = self.min_delay_between_requests - time_since_last
+            await asyncio.sleep(wait_time)
+        
+        # Registrar petición
+        self.last_request_time = time.time()
+        self.request_times.append(self.last_request_time)
+        self.request_count += 1
 
     async def copy_content(self, channel_url: str, message_id: int, is_premium: bool = False):
         """Copiar contenido de un canal"""
         try:
+            # Control de rate limiting
+            await self.rate_limit_check()
+            
             # Asegurar conexión
             if not await self.ensure_connected():
                 return None, "❌ Error de conexión al cliente"
@@ -134,6 +179,9 @@ class ContentCopyBot:
     async def bulk_copy(self, channel_url: str, limit: int = 10):
         """Copia masiva de contenido (solo premium)"""
         try:
+            # Control de rate limiting
+            await self.rate_limit_check()
+            
             # Asegurar conexión
             if not await self.ensure_connected():
                 return None, "❌ Error de conexión al cliente"
@@ -167,6 +215,9 @@ class ContentCopyBot:
     async def get_channel_info(self, channel_url: str):
         """Obtener información del canal"""
         try:
+            # Control de rate limiting
+            await self.rate_limit_check()
+            
             if not await self.ensure_connected():
                 return None, "❌ Error de conexión"
                 
@@ -436,9 +487,9 @@ async def bulk_copy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             copied_count += 1
             
-            # Pausa para evitar límites de rate
+            # Pausa más larga para evitar límites de rate en copia masiva
             if i < len(messages) - 1:
-                await asyncio.sleep(1)
+                await asyncio.sleep(3)  # 3 segundos entre mensajes para mayor seguridad
             
         except Exception as e:
             logger.error(f"Error copiando mensaje {i+1}: {e}")
