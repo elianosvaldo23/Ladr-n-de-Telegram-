@@ -1,670 +1,489 @@
-import logging
-import re
-import asyncio
-from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from telethon import TelegramClient
-from telethon.tl.functions.messages import GetHistoryRequest
-from telethon.errors import ChannelPrivateError, UsernameNotOccupiedError, SessionPasswordNeededError
-import os
-from dotenv import load_dotenv
-from telethon.sessions import StringSession
-import time
+"""
+Telegram Content Copy Bot - Entry Point
+========================================
+Flat architecture (all files in root, no subfolders):
+  bot.py            - Application setup, lifecycle hooks, main()
+  copy_bot.py       - ContentCopyBot and UserbotConfig
+  state.py          - Global shared state (db, copy_bot instances)
+  database.py       - MongoDB operations
+  start_handler.py  - /start command and main menu
+  button_handler.py - Inline button callbacks
+  link_handler.py   - Telegram link processing
+  config_handler.py - Userbot config conversation
+  admin_handler.py  - Admin actions (premium, broadcast)
+  config.py         - Configuration constants
+  exceptions.py     - Custom exception classes
+  logging_utils.py  - Logging setup and sanitization
+  memory.py         - Memory and disk monitoring
+  progress.py       - File transfer progress tracker
+  strings.py        - Centralized UI strings
+"""
 
-# Configurar logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+import os
+import signal
+import sys
+import asyncio
+import logging
+import threading
+import warnings
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+warnings.filterwarnings('ignore', category=UserWarning, module='telegram')
+
+# ============== Setup logging FIRST ==============
+from logging_utils import setup_logging
+setup_logging()
+
 logger = logging.getLogger(__name__)
 
-# Cargar variables de entorno
-load_dotenv()
 
-# Configuración desde variables de entorno
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH")
-PHONE_NUMBER = os.getenv("PHONE_NUMBER")
+# ============== Health check server — start IMMEDIATELY ==============
+# Render requires a bound port; start before any heavy imports (DB, Pyrogram).
 
-# Lista de usuarios premium desde variable de entorno
-try:
-    premium_users_str = os.getenv("PREMIUM_USERS", "")
-    PREMIUM_USERS = {int(uid.strip()) for uid in premium_users_str.split(",") if uid.strip()}
-except ValueError:
-    PREMIUM_USERS = set()
-    logger.warning("Error al parsear PREMIUM_USERS, usando conjunto vacío")
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler for Render health checks."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, *args):
+        pass  # Suppress per-request logs
 
-# Verificar que las variables estén configuradas
-if not all([BOT_TOKEN, API_ID, API_HASH, PHONE_NUMBER]):
-    logger.error("Faltan variables de entorno requeridas. Verifica tu archivo .env")
-    raise ValueError("Configuración incompleta")
 
-class ContentCopyBot:
-    def __init__(self):
-        # Usar StringSession vacía para comenzar
-        self.session_string = ""
-        self.client = None
-        self.is_initialized = False
-        # Control de rate limiting para evitar ban
-        self.last_request_time = 0
-        self.min_delay_between_requests = 2.0  # segundos entre peticiones
-        self.request_count = 0
-        self.request_limit_per_minute = 20  # límite de peticiones por minuto
-        self.request_times = []
-        
-    async def initialize_client(self):
-        """Inicializar y autenticar el cliente de Telethon"""
-        if self.is_initialized:
-            return True
-            
-        try:
-            # Crear cliente con StringSession
-            self.client = TelegramClient(StringSession(self.session_string), API_ID, API_HASH)
-            
-            # Conectar cliente
-            await self.client.connect()
-            
-            # Verificar si ya está autorizado
-            if not await self.client.is_user_authorized():
-                logger.info("Cliente no autorizado, iniciando proceso de autenticación...")
-                
-                # Enviar código
-                await self.client.send_code_request(PHONE_NUMBER)
-                logger.info(f"Código enviado a {PHONE_NUMBER}")
-                
-                # Nota: En producción, necesitarías una forma de manejar esto
-                # Por ahora, asumimos que ya tienes una sesión válida guardada
-                return False
-            
-            self.is_initialized = True
-            logger.info("Cliente de Telethon inicializado correctamente")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error inicializando cliente: {e}")
-            return False
-
-    async def ensure_connected(self):
-        """Asegurar que el cliente esté conectado"""
-        if not self.client:
-            await self.initialize_client()
-            
-        if not self.client.is_connected():
-            await self.client.connect()
-            
-        return self.client.is_connected()
-    
-    async def rate_limit_check(self):
-        """Control de rate limiting para evitar ban de Telegram"""
-        current_time = time.time()
-        
-        # Limpiar peticiones antiguas (más de 1 minuto)
-        self.request_times = [t for t in self.request_times if current_time - t < 60]
-        
-        # Verificar límite por minuto
-        if len(self.request_times) >= self.request_limit_per_minute:
-            wait_time = 60 - (current_time - self.request_times[0])
-            if wait_time > 0:
-                logger.warning(f"Rate limit alcanzado. Esperando {wait_time:.1f} segundos...")
-                await asyncio.sleep(wait_time + 1)
-                self.request_times = []
-        
-        # Verificar delay mínimo entre peticiones
-        time_since_last = current_time - self.last_request_time
-        if time_since_last < self.min_delay_between_requests:
-            wait_time = self.min_delay_between_requests - time_since_last
-            await asyncio.sleep(wait_time)
-        
-        # Registrar petición
-        self.last_request_time = time.time()
-        self.request_times.append(self.last_request_time)
-        self.request_count += 1
-
-    async def copy_content(self, channel_url: str, message_id: int, is_premium: bool = False):
-        """Copiar contenido de un canal"""
-        try:
-            # Control de rate limiting
-            await self.rate_limit_check()
-            
-            # Asegurar conexión
-            if not await self.ensure_connected():
-                return None, "❌ Error de conexión al cliente"
-            
-            # Extraer username del canal
-            username = self.extract_username(channel_url)
-            if not username:
-                return None, "❌ URL de canal inválida"
-            
-            logger.info(f"Intentando acceder al canal: {username}")
-            
-            # Obtener entidad del canal
-            try:
-                entity = await self.client.get_entity(username)
-                logger.info(f"Canal encontrado: {entity.title if hasattr(entity, 'title') else username}")
-            except ChannelPrivateError:
-                if not is_premium:
-                    return None, "🔒 Este es un canal privado. Necesitas la versión Premium."
-                return None, "❌ Canal privado inaccesible"
-            except UsernameNotOccupiedError:
-                return None, "❌ Canal no encontrado"
-            except Exception as e:
-                return None, f"❌ Error accediendo al canal: {str(e)}"
-            
-            # Obtener mensaje específico
-            try:
-                messages = await self.client.get_messages(entity, ids=message_id)
-                
-                # get_messages puede devolver una lista o un mensaje único
-                if isinstance(messages, list):
-                    message = messages[0] if messages else None
-                else:
-                    message = messages
-                
-                if not message:
-                    return None, "❌ Mensaje no encontrado"
-                
-                logger.info(f"Mensaje obtenido: ID {message.id}")
-                return message, None
-                
-            except Exception as e:
-                logger.error(f"Error obteniendo mensaje: {e}")
-                return None, f"❌ Error al obtener el mensaje: {str(e)}"
-                
-        except Exception as e:
-            logger.error(f"Error general en copy_content: {e}")
-            return None, f"❌ Error general: {str(e)}"
-
-    async def bulk_copy(self, channel_url: str, limit: int = 10):
-        """Copia masiva de contenido (solo premium)"""
-        try:
-            # Control de rate limiting
-            await self.rate_limit_check()
-            
-            # Asegurar conexión
-            if not await self.ensure_connected():
-                return None, "❌ Error de conexión al cliente"
-            
-            username = self.extract_username(channel_url)
-            if not username:
-                return None, "❌ URL de canal inválida"
-            
-            logger.info(f"Iniciando copia masiva de {username}, límite: {limit}")
-            
-            try:
-                entity = await self.client.get_entity(username)
-                logger.info(f"Canal encontrado para copia masiva: {entity.title if hasattr(entity, 'title') else username}")
-            except Exception as e:
-                return None, f"❌ Error accediendo al canal: {str(e)}"
-            
-            # Obtener mensajes
-            try:
-                messages = await self.client.get_messages(entity, limit=limit)
-                logger.info(f"Obtenidos {len(messages)} mensajes")
-                return messages, None
-                
-            except Exception as e:
-                logger.error(f"Error obteniendo mensajes: {e}")
-                return None, f"❌ Error obteniendo mensajes: {str(e)}"
-            
-        except Exception as e:
-            logger.error(f"Error en bulk_copy: {e}")
-            return None, f"❌ Error en copia masiva: {str(e)}"
-
-    async def get_channel_info(self, channel_url: str):
-        """Obtener información del canal"""
-        try:
-            # Control de rate limiting
-            await self.rate_limit_check()
-            
-            if not await self.ensure_connected():
-                return None, "❌ Error de conexión"
-                
-            username = self.extract_username(channel_url)
-            if not username:
-                return None, "❌ URL inválida"
-                
-            entity = await self.client.get_entity(username)
-            
-            info = {
-                'title': getattr(entity, 'title', 'Sin título'),
-                'username': getattr(entity, 'username', username),
-                'id': entity.id,
-                'participants_count': getattr(entity, 'participants_count', 0),
-                'is_private': hasattr(entity, 'access_hash')
-            }
-            
-            return info, None
-            
-        except Exception as e:
-            return None, f"❌ Error obteniendo info: {str(e)}"
-
-    @staticmethod
-    def extract_username(url: str) -> Optional[str]:
-        """Extraer username de URL de Telegram"""
-        patterns = [
-            r't\.me/([^/\?]+)',
-            r'telegram\.me/([^/\?]+)',
-            r'@([a-zA-Z0-9_]+)'
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                username = match.group(1)
-                # Limpiar parámetros adicionales
-                username = username.split('?')[0]
-                return username
-        return None
-
-    @staticmethod
-    def extract_message_id(url: str) -> Optional[int]:
-        """Extraer ID del mensaje de la URL"""
-        match = re.search(r'/(\d+)(?:\?|$)', url)
-        if match:
-            return int(match.group(1))
-        return None
-
-# Instancia global del bot
-copy_bot = ContentCopyBot()
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start"""
-    user = update.effective_user
-    
-    # Inicializar cliente en el primer uso
-    if not copy_bot.is_initialized:
-        await update.message.reply_text("🔄 Inicializando sistema...")
-        success = await copy_bot.initialize_client()
-        if not success:
-            await update.message.reply_text("⚠️ Sistema en modo limitado. Algunas funciones pueden no estar disponibles.")
-    
-    welcome_text = f"""👋 ¡Hola {user.first_name}!
-
-💬 Puedo saltar las restricciones de copia, descarga y reenvío de los canales.
-
-🔗 Envíame el enlace de una publicación, realizada en un Canal con Protección de Contenido, para copiar su contenido aquí.
-
-• Versión Gratuita:
-- Permite copiar de canales públicos.
-
-• Versión Premium:
-- Permite copiar de canales públicos.
-- Permite copiar de canales privados.
-- Permite la copia masiva del contenido.
-
-📋 Comandos disponibles:
-/help - Ver ayuda
-/premium - Información sobre versión premium
-/status - Ver tu estado actual
-/info [enlace] - Ver información del canal"""
-
-    keyboard = [
-        [InlineKeyboardButton("📋 Ver Comandos", callback_data='help')],
-        [InlineKeyboardButton("⭐ Premium", callback_data='premium')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /help"""
-    help_text = """📋 **Comandos Disponibles:**
-
-🔗 **Copia Simple:**
-Envía un enlace de canal como:
-`https://t.me/canal/123`
-
-📊 **Comandos:**
-/start - Iniciar el bot
-/help - Ver esta ayuda
-/premium - Info sobre versión premium
-/status - Ver tu estado
-/bulk [enlace] [cantidad] - Copia masiva (Premium)
-/info [enlace] - Ver información del canal
-
-🎯 **Formatos Soportados:**
-• Texto
-• Imágenes
-• Videos
-• Documentos
-• Audio
-• Stickers
-• Enlaces
-
-⚠️ **Importante:**
-- Respeta los derechos de autor
-- Usa responsablemente"""
-
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-async def premium_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /premium"""
-    user_id = update.effective_user.id
-    is_premium = user_id in PREMIUM_USERS
-    
-    if is_premium:
-        text = """⭐ **Versión Premium Activa**
-
-✅ Funciones disponibles:
-• Copia de canales públicos
-• Copia de canales privados
-• Copia masiva de contenido
-• Información detallada de canales
-• Soporte prioritario
-
-🚀 ¡Disfruta de todas las funciones!"""
-    else:
-        text = """⭐ **Versión Premium**
-
-🔓 Desbloquea funciones adicionales:
-• Acceso a canales privados
-• Copia masiva de contenido
-• Información detallada de canales
-• Soporte prioritario
-• Sin límites de uso
-
-💰 Precio: $5/mes
-
-Para activar Premium, contacta: @admin"""
-
-    keyboard = []
-    if not is_premium:
-        keyboard.append([InlineKeyboardButton("💳 Activar Premium", callback_data='activate_premium')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /status"""
-    user = update.effective_user
-    is_premium = user.id in PREMIUM_USERS
-    
-    # Verificar estado del cliente
-    client_status = "🟢 Conectado" if copy_bot.is_initialized and copy_bot.client and copy_bot.client.is_connected() else "🔴 Desconectado"
-    
-    status_text = f"""📊 **Estado de Usuario**
-
-👤 Usuario: {user.first_name}
-🆔 ID: {user.id}
-⭐ Plan: {'Premium' if is_premium else 'Gratuito'}
-🔌 Cliente: {client_status}
-
-📈 **Funciones Disponibles:**
-{'✅' if True else '❌'} Canales públicos
-{'✅' if is_premium else '❌'} Canales privados
-{'✅' if is_premium else '❌'} Copia masiva
-{'✅' if is_premium else '❌'} Info detallada"""
-
-    await update.message.reply_text(status_text, parse_mode='Markdown')
-
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /info"""
-    user_id = update.effective_user.id
-    is_premium = user_id in PREMIUM_USERS
-    
-    if not is_premium:
-        await update.message.reply_text("⭐ Esta función requiere Premium. Usa /premium para más info.")
-        return
-    
-    if len(context.args) < 1:
-        await update.message.reply_text("📋 Uso: /info [enlace_canal]\nEjemplo: /info https://t.me/canal")
-        return
-    
-    channel_url = context.args[0]
-    await update.message.reply_text("🔍 Obteniendo información del canal...")
-    
-    info, error = await copy_bot.get_channel_info(channel_url)
-    
-    if error:
-        await update.message.reply_text(error)
-        return
-    
-    info_text = f"""📊 **Información del Canal**
-
-📛 Título: {info['title']}
-👤 Username: @{info['username']}
-🆔 ID: {info['id']}
-👥 Miembros: {info['participants_count']:,}
-🔒 Tipo: {'Privado' if info['is_private'] else 'Público'}"""
-
-    await update.message.reply_text(info_text, parse_mode='Markdown')
-
-async def bulk_copy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /bulk"""
-    user_id = update.effective_user.id
-    
-    if user_id not in PREMIUM_USERS:
-        await update.message.reply_text("⭐ Esta función requiere Premium. Usa /premium para más info.")
-        return
-    
-    if len(context.args) < 1:
-        await update.message.reply_text("📋 Uso: /bulk [enlace_canal] [cantidad]\nEjemplo: /bulk https://t.me/canal 10")
-        return
-    
-    channel_url = context.args[0]
-    limit = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 10
-    
-    if limit > 50:
-        await update.message.reply_text("⚠️ Límite máximo: 50 mensajes")
-        return
-    
-    await update.message.reply_text("🔄 Iniciando copia masiva...")
-    
-    messages, error = await copy_bot.bulk_copy(channel_url, limit)
-    
-    if error:
-        await update.message.reply_text(error)
-        return
-    
-    if not messages:
-        await update.message.reply_text("❌ No se encontraron mensajes")
-        return
-    
-    await update.message.reply_text(f"✅ Encontrados {len(messages)} mensajes. Iniciando copia...")
-    
-    copied_count = 0
-    for i, msg in enumerate(messages):
-        try:
-            if not msg:
-                continue
-                
-            # Enviar mensaje según su tipo
-            if msg.text:
-                await update.message.reply_text(f"📝 **Mensaje {i+1}:**\n\n{msg.text}", parse_mode='Markdown')
-            elif msg.photo:
-                await update.message.reply_photo(msg.photo, caption=f"📸 Imagen {i+1}\n{msg.caption or ''}")
-            elif msg.video:
-                await update.message.reply_video(msg.video, caption=f"🎥 Video {i+1}\n{msg.caption or ''}")
-            elif msg.document:
-                await update.message.reply_document(msg.document, caption=f"📎 Documento {i+1}\n{msg.caption or ''}")
-            elif msg.audio:
-                await update.message.reply_audio(msg.audio, caption=f"🎵 Audio {i+1}\n{msg.caption or ''}")
-            elif msg.sticker:
-                await update.message.reply_sticker(msg.sticker)
-            else:
-                await update.message.reply_text(f"📄 Mensaje {i+1}: Tipo de contenido no soportado")
-            
-            copied_count += 1
-            
-            # Pausa más larga para evitar límites de rate en copia masiva
-            if i < len(messages) - 1:
-                await asyncio.sleep(3)  # 3 segundos entre mensajes para mayor seguridad
-            
-        except Exception as e:
-            logger.error(f"Error copiando mensaje {i+1}: {e}")
-            await update.message.reply_text(f"❌ Error copiando mensaje {i+1}: {str(e)}")
-            continue
-    
-    await update.message.reply_text(f"✅ Copia masiva completada: {copied_count}/{len(messages)} mensajes copiados")
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manejar enlaces de Telegram"""
-    text = update.message.text
-    user_id = update.effective_user.id
-    is_premium = user_id in PREMIUM_USERS
-    
-    # Verificar si es un enlace de Telegram
-    if not re.search(r't\.me|telegram\.me', text):
-        await update.message.reply_text("❌ Por favor envía un enlace válido de Telegram")
-        return
-    
-    # Extraer ID del mensaje
-    message_id = copy_bot.extract_message_id(text)
-    if not message_id:
-        await update.message.reply_text("❌ No se pudo extraer el ID del mensaje del enlace.\nAsegúrate de enviar un enlace completo como: https://t.me/canal/123")
-        return
-    
-    await update.message.reply_text("🔄 Procesando enlace...")
-    
-    # Copiar contenido
-    message, error = await copy_bot.copy_content(text, message_id, is_premium)
-    
-    if error:
-        await update.message.reply_text(error)
-        return
-    
-    if not message:
-        await update.message.reply_text("❌ No se pudo obtener el contenido")
-        return
-    
-    # Enviar contenido copiado según su tipo
+def _start_health_server(port: int) -> None:
+    """Start a background HTTP server so Render detects an open port."""
     try:
-        if message.text:
-            await update.message.reply_text(f"📋 **Contenido copiado:**\n\n{message.text}", parse_mode='Markdown')
-        elif message.photo:
-            await update.message.reply_photo(
-                message.photo, 
-                caption=f"📸 **Imagen copiada**\n{message.caption or ''}"
-            )
-        elif message.video:
-            await update.message.reply_video(
-                message.video, 
-                caption=f"🎥 **Video copiado**\n{message.caption or ''}"
-            )
-        elif message.document:
-            await update.message.reply_document(
-                message.document, 
-                caption=f"📎 **Documento copiado**\n{message.caption or ''}"
-            )
-        elif message.audio:
-            await update.message.reply_audio(
-                message.audio, 
-                caption=f"🎵 **Audio copiado**\n{message.caption or ''}"
-            )
-        elif message.voice:
-            await update.message.reply_voice(
-                message.voice, 
-                caption="🎤 **Nota de voz copiada**"
-            )
-        elif message.sticker:
-            await update.message.reply_sticker(message.sticker)
-            await update.message.reply_text("🎭 **Sticker copiado**")
-        elif message.animation:
-            await update.message.reply_animation(
-                message.animation, 
-                caption=f"🎬 **GIF copiado**\n{message.caption or ''}"
-            )
-        else:
-            await update.message.reply_text("✅ Contenido procesado (tipo de mensaje no soportado para vista previa)")
-            
+        server = HTTPServer(('0.0.0.0', port), _HealthHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"Health-check server escuchando en puerto {port}")
     except Exception as e:
-        logger.error(f"Error enviando contenido: {e}")
-        await update.message.reply_text(f"❌ Error al enviar contenido: {str(e)}")
+        logger.warning(f"No se pudo iniciar health-check server: {e}")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manejar botones inline"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == 'help':
-        # Crear update falso para reutilizar la función
-        fake_update = Update(
-            update_id=query.message.message_id,
-            message=query.message
-        )
-        await help_command(fake_update, context)
-    elif query.data == 'premium':
-        fake_update = Update(
-            update_id=query.message.message_id,
-            message=query.message,
-            effective_user=query.from_user
-        )
-        fake_update.effective_user = query.from_user
-        await premium_info(fake_update, context)
-    elif query.data == 'activate_premium':
-        await query.edit_message_text(
-            f"💳 **Activar Premium**\n\n"
-            f"Para activar Premium, contacta a @admin con la siguiente información:\n\n"
-            f"👤 Usuario: {query.from_user.first_name}\n"
-            f"🆔 ID: {query.from_user.id}\n"
-            f"📱 Username: @{query.from_user.username or 'Sin username'}\n\n"
-            f"💰 Precio: $5/mes",
-            parse_mode='Markdown'
-        )
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manejar errores"""
-    logger.error(f"Update {update} caused error {context.error}")
-    
+# Start health server at import time (before DB/Pyrogram initialization)
+_PORT = int(os.getenv('PORT', '10000'))
+_ENV = os.getenv('ENVIRONMENT', 'development')
+_USE_WEBHOOK = (_ENV == 'production' and os.getenv('WEBHOOK_URL'))
+
+if not _USE_WEBHOOK:
+    _start_health_server(_PORT)
+
+
+# ============== Now load heavy modules (DB, Pyrogram, handlers) ==============
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, ContextTypes, filters
+)
+
+from config import (
+    BOT_TOKEN, ADMIN_ID,
+    CONFIG_API_ID, CONFIG_API_HASH, CONFIG_PHONE, CONFIG_CODE, CONFIG_2FA
+)
+from memory import log_memory_usage
+from state import db, copy_bot, get_premium_users
+
+from start_handler import start
+from button_handler import button_handler
+from link_handler import handle_link
+from config_handler import (
+    config_api_id, config_api_hash, config_phone,
+    config_code, config_2fa, cancel_config
+)
+
+
+# ============== Error & config message handlers ==============
+
+async def handle_config_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fallback guard: reply with a warning if a message arrives while
+    the admin is mid-configuration and then clear the conversation state."""
+    if not context.user_data.get('configuring_userbot'):
+        return
+    await update.message.reply_text(
+        "⚠️ Proceso de configuración interrumpido.\nUsa /start para volver a configurar."
+    )
+    context.user_data.clear()
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler: logs the full traceback and sends a generic
+    error notice to the user so they know something went wrong."""
+    logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
     if update and update.effective_message:
         await update.effective_message.reply_text(
             "❌ Ocurrió un error interno. Por favor intenta nuevamente."
         )
 
-async def shutdown_handler(application: Application):
-    """Manejar cierre del bot"""
-    if copy_bot.client and copy_bot.client.is_connected():
-        await copy_bot.client.disconnect()
-    logger.info("Bot desconectado correctamente")
 
-def main():
-    """Función principal"""
+# ============== Premium check job ==============
+
+async def check_premium_expirations(application: Application) -> None:
+    """Notify users whose premium expires within 3 days, and
+    deactivate any fully-expired premiums."""
     try:
-        # Crear aplicación
-        app = Application.builder().token(BOT_TOKEN).build()
-        
-        # Configurar shutdown handler
-        app.add_handler(CommandHandler("shutdown", shutdown_handler))
-        
-        # Registrar handlers
+        expiring_users = db.get_users_expiring_soon(days=3)
+        if not expiring_users:
+            return
+
+        for user in expiring_users:
+            user_id = user['user_id']
+            first_name = user.get('first_name', 'Usuario')
+            days_remaining = user['days_remaining']
+            expiry_date = user['expiry_date']
+
+            message = (
+                f"⚠️ **Tu Premium está por expirar**\n\n"
+                f"👤 Hola {first_name},\n\n"
+                f"📅 Tu suscripción Premium expira el "
+                f"**{expiry_date.strftime('%d/%m/%Y')}** "
+                f"(en **{days_remaining} días**).\n\n"
+                f"💳 Contacta al administrador para renovar."
+            )
+
+            try:
+                await application.bot.send_message(
+                    chat_id=user_id, text=message, parse_mode='Markdown'
+                )
+                db.mark_expiry_notified(user_id)
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+        # Deactivate expired premiums
+        expired_ids = db.check_expired_premium()
+        if expired_ids:
+            logger.info(f"⚠️ {len(expired_ids)} premiums desactivados")
+            for uid in expired_ids:
+                try:
+                    await application.bot.send_message(
+                        chat_id=uid,
+                        text="ℹ️ **Tu Premium ha expirado**\n\n"
+                             "Contacta al administrador para renovar.\n"
+                             "Usa /start para ver opciones.",
+                        parse_mode='Markdown'
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"Error verificando premiums: {e}")
+
+
+async def premium_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job wrapper for premium checks"""
+    await check_premium_expirations(context.application)
+
+
+# ============== Lifecycle hooks ==============
+
+async def shutdown_handler(application: Application) -> None:
+    """Graceful shutdown hook: wait up to 30 s for in-flight background
+    tasks, then disconnect the Pyrogram userbot client."""
+    logger.info("🛑 Iniciando shutdown graceful...")
+
+    try:
+        if hasattr(application, 'background_tasks') and application.background_tasks:
+            active = len(application.background_tasks)
+            logger.info(f"⏳ Esperando {active} tareas en background...")
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*application.background_tasks, return_exceptions=True),
+                    timeout=30.0
+                )
+                logger.info("✅ Tareas completadas")
+            except asyncio.TimeoutError:
+                cancelled = sum(1 for t in application.background_tasks if not t.done() and t.cancel())
+                logger.warning(f"⚠️ {cancelled} tareas canceladas por timeout")
+                await asyncio.sleep(5)
+    except Exception as e:
+        logger.error(f"Error en shutdown: {e}")
+
+    try:
+        if copy_bot.client and copy_bot.client.is_connected:
+            await asyncio.wait_for(copy_bot.client.stop(), timeout=30.0)
+            logger.info("✅ Pyrogram desconectado")
+    except Exception as e:
+        logger.error(f"Error desconectando Pyrogram: {e}")
+
+    logger.info("✅ Shutdown completado")
+
+
+async def post_init(application: Application) -> None:
+    """Post-initialization lifecycle hook.
+
+    Starts the heartbeat task (every 5 min), the pending-joins monitor
+    (every 30 s), connects the Pyrogram userbot (up to 3 retries), and
+    deactivates any expired premium accounts.
+    """
+
+    # --- Heartbeat task (every 5 minutes) ---
+    async def heartbeat_task():
+        consecutive_errors = 0
+        heartbeat_count = 0
+        while True:
+            try:
+                await asyncio.sleep(300)
+                heartbeat_count += 1
+                consecutive_errors = 0
+
+                active = len(getattr(application, 'background_tasks', set()))
+                transfers = copy_bot._active_transfers
+                reserved_mb = copy_bot._reserved_disk_bytes / (1024*1024)
+                logger.info(
+                    f"💓 Heartbeat - Bot ACTIVO. Tareas: {active}, "
+                    f"Transferencias: {transfers}, Disco reservado: {reserved_mb:.0f} MB"
+                )
+
+                if heartbeat_count % 5 == 0:
+                    log_memory_usage("heartbeat")
+
+                # Periodic cleanup: remove temp files OLDER THAN 30 MINUTES.
+                # IMPORTANT: Do NOT use max_age_seconds=0 here!
+                # That was the ROOT CAUSE of upload failures: the heartbeat
+                # was deleting files while they were being uploaded (a 1.4 GB
+                # upload takes 4+ minutes, and the heartbeat runs every 5 min).
+                # The _transfer_active flag adds extra protection, but using
+                # a safe max_age of 30 min ensures we only clean true orphans.
+                try:
+                    freed = copy_bot._cleanup_temp_files(max_age_seconds=1800)
+                    if freed > 0:
+                        disk_free = copy_bot._get_disk_free()
+                        logger.info(
+                            f"🧹 Heartbeat cleanup: {freed/(1024*1024):.1f} MB "
+                            f"liberados, disco libre: {disk_free/(1024*1024):.0f} MB"
+                        )
+                    elif copy_bot._transfer_active:
+                        logger.debug(
+                            "🛡️ Heartbeat: transferencia activa, "
+                            "cleanup omitido para proteger archivos"
+                        )
+                except Exception as cleanup_err:
+                    logger.debug(f"Cleanup en heartbeat: {cleanup_err}")
+
+                if copy_bot.config.is_configured():
+                    if not copy_bot.is_initialized or not copy_bot.client or not copy_bot.client.is_connected:
+                        logger.warning("⚠️ Userbot desconectado, reconectando...")
+                        try:
+                            await copy_bot.initialize_client(force_recreate=True)
+                        except Exception as e:
+                            logger.error(f"❌ Error reconectando: {e}")
+                            consecutive_errors += 1
+
+                try:
+                    await application.bot.get_me()
+                except Exception as e:
+                    logger.error(f"❌ Bot no responde: {e}")
+                    consecutive_errors += 1
+
+                if consecutive_errors >= 5:
+                    logger.error("❌ Demasiados errores, reiniciando conexiones...")
+                    if copy_bot.config.is_configured():
+                        await copy_bot.initialize_client(force_recreate=True)
+                    consecutive_errors = 0
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"❌ Error en heartbeat: {e}")
+
+    # --- Pending joins monitor (every 30s) ---
+    async def monitor_pending_joins():
+        while True:
+            try:
+                await asyncio.sleep(30)
+                if copy_bot.pending_join:
+                    await copy_bot.check_pending_join_approvals(application.bot)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"❌ Error en monitor joins: {e}")
+
+    # Start background tasks
+    if not hasattr(application, 'background_tasks'):
+        application.background_tasks = set()
+
+    for coro_fn in (heartbeat_task, monitor_pending_joins):
+        task = asyncio.create_task(coro_fn())
+        application.background_tasks.add(task)
+        task.add_done_callback(application.background_tasks.discard)
+
+    # --- Connect userbot (3 retries) ---
+    if copy_bot.config.is_configured():
+        logger.info("Conectando userbot...")
+        for attempt in range(1, 4):
+            try:
+                success = await copy_bot.initialize_client(force_recreate=(attempt > 1))
+                if success:
+                    logger.info("✅ Userbot conectado")
+                    if ADMIN_ID:
+                        try:
+                            await application.bot.send_message(
+                                chat_id=ADMIN_ID,
+                                text="✅ **Bot Iniciado**\n\nUserbot conectado correctamente.",
+                                parse_mode='Markdown'
+                            )
+                        except Exception:
+                            pass
+                    break
+                elif attempt < 3:
+                    await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"❌ Intento {attempt}/3: {e}")
+                if attempt < 3:
+                    await asyncio.sleep(5)
+        else:
+            logger.error("❌ Userbot no conectado después de 3 intentos")
+            if ADMIN_ID:
+                try:
+                    await application.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text="⚠️ **Bot Iniciado - Userbot No Disponible**\n\n"
+                             "Usa /start → '⚙️ Configurar Userbot' para reconfigurar.",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+    else:
+        logger.info("Userbot no configurado")
+        if ADMIN_ID:
+            try:
+                await application.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text="🔧 **Bot Iniciado - Configuración Requerida**\n\n"
+                         "Usa /start → '⚙️ Configurar Userbot'.",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass
+
+    # --- Check expired premiums on startup ---
+    try:
+        expired_ids = db.check_expired_premium()
+        if expired_ids:
+            logger.info(f"⚠️ {len(expired_ids)} premiums desactivados al inicio")
+            for uid in expired_ids:
+                try:
+                    await application.bot.send_message(
+                        chat_id=uid,
+                        text="ℹ️ **Tu Premium ha expirado**\n\nUsa /start para ver opciones.",
+                        parse_mode='Markdown'
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"Error verificando premiums: {e}")
+
+
+# ============== Main ==============
+
+def main() -> None:
+    """Application entry point - builds and runs the Telegram bot."""
+    shutdown_initiated = False
+
+    def signal_handler(signum, frame):
+        nonlocal shutdown_initiated
+        if shutdown_initiated:
+            sys.exit(1)
+        shutdown_initiated = True
+        logger.info(f"🛑 Señal {signal.Signals(signum).name} recibida, shutdown graceful...")
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Health server already started at module level (before heavy imports)
+    PORT = _PORT
+    env = _ENV
+    use_webhook = _USE_WEBHOOK
+
+    try:
+        app = (Application.builder()
+               .token(BOT_TOKEN)
+               .post_init(post_init)
+               .post_shutdown(shutdown_handler)
+               .read_timeout(3600)
+               .write_timeout(3600)
+               .connect_timeout(60)
+               .pool_timeout(60)
+               .get_updates_read_timeout(60)
+               .get_updates_write_timeout(60)
+               .get_updates_connect_timeout(60)
+               .get_updates_pool_timeout(10)
+               .build())
+
+        # Conversation handler for userbot config
+        config_conv = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(button_handler, pattern='^start_config$'),
+                CallbackQueryHandler(button_handler, pattern='^reconfig_userbot$')
+            ],
+            states={
+                CONFIG_API_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, config_api_id),
+                                CallbackQueryHandler(cancel_config, pattern='^cancel_config_btn$')],
+                CONFIG_API_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, config_api_hash),
+                                  CallbackQueryHandler(cancel_config, pattern='^cancel_config_btn$')],
+                CONFIG_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, config_phone),
+                               CallbackQueryHandler(cancel_config, pattern='^cancel_config_btn$')],
+                CONFIG_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, config_code),
+                              CallbackQueryHandler(cancel_config, pattern='^cancel_config_btn$')],
+                CONFIG_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, config_2fa),
+                             CallbackQueryHandler(cancel_config, pattern='^cancel_config_btn$')],
+            },
+            fallbacks=[
+                CommandHandler('cancel', cancel_config),
+                CallbackQueryHandler(cancel_config, pattern='^cancel_config_btn$')
+            ],
+            per_message=False,
+        )
+
+        app.background_tasks = set()
+
+        # Premium check job every 6 hours
+        if app.job_queue:
+            app.job_queue.run_repeating(premium_check_job, interval=21600, first=10)
+            logger.info("📅 Job de premium configurado (cada 6h)")
+
+        # Register handlers
         app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("premium", premium_info))
-        app.add_handler(CommandHandler("status", status_command))
-        app.add_handler(CommandHandler("bulk", bulk_copy_command))
-        app.add_handler(CommandHandler("info", info_command))
+        app.add_handler(CommandHandler("cancel", cancel_config))
+        app.add_handler(config_conv)
         app.add_handler(CallbackQueryHandler(button_handler))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
         app.add_error_handler(error_handler)
-        
-        # Configuración para producción/desarrollo
-        PORT = int(os.getenv('PORT', '8080'))
-        
-        # Mensaje de inicio
-        print("🤖 Bot iniciado correctamente...")
-        logger.info("Bot iniciado correctamente")
-        
-        # Iniciar el bot
-        if os.getenv('ENVIRONMENT') == 'production':
-            # Modo producción
-            webhook_url = os.getenv('WEBHOOK_URL')
-            if webhook_url:
-                app.run_webhook(
-                    listen="0.0.0.0",
-                    port=PORT,
-                    webhook_url=webhook_url
-                )
-            else:
-                logger.error("WEBHOOK_URL no configurada para producción")
-                app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+        # Startup log (una sola vez, consolidado)
+        premium_count = len(get_premium_users())
+        userbot_status = 'SÍ' if copy_bot.config.is_configured() else 'NO'
+        logger.info(
+            f"🚀 INICIANDO BOT | Entorno: {env} | Admin: {ADMIN_ID} "
+            f"| Premium: {premium_count} | Puerto: {PORT} | Userbot: {userbot_status}"
+        )
+
+        if use_webhook:
+            app.run_webhook(
+                listen="0.0.0.0", port=PORT,
+                webhook_url=os.getenv('WEBHOOK_URL'),
+                drop_pending_updates=True
+            )
         else:
-            # Modo desarrollo
-            app.run_polling(allowed_updates=Update.ALL_TYPES)
-            
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                poll_interval=1.0, timeout=30
+            )
+
+    except KeyboardInterrupt:
+        logger.info("🛑 Interrupción por teclado")
     except Exception as e:
-        logger.error(f"Error crítico en la ejecución del bot: {e}")
+        logger.error(f"❌ Error crítico: {e}", exc_info=True)
         raise
+    finally:
+        logger.info("✅ Bot detenido")
+        print("\n✅ Bot detenido correctamente\n")
+
 
 if __name__ == '__main__':
     main()
